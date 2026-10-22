@@ -32,6 +32,11 @@ type SemaphoreOptions struct {
 	LockOptions storage_lock.StorageLockOptions
 	// OwnerID 是业务 owner 的可选标识。每次 Acquire 都会在它后面追加唯一 nonce。
 	OwnerID string
+	// PermitTTL 是许可的最大持有时间。为 0 时许可由 supervisor 持续续租，
+	// 持有者不释放就一直占着（现有行为）。大于 0 时许可到期自动过期：
+	// 到期后持有者持有的 slot 被主动释放，其他客户端可立即抢占，无需等待
+	// 持有者主动释放——适合"必须在限时内用完许可"的场景。
+	PermitTTL time.Duration
 }
 
 // Semaphore 是固定容量的分布式信号量。
@@ -125,9 +130,17 @@ func (s *Semaphore) tryAcquire(ctx context.Context) (*Permit, error) {
 		permit := &Permit{
 			lock: lock, ownerID: ownerID, slotID: lockID, token: token,
 			refreshEvery: supervisorInterval(options.LeaseExpireAfter),
+			ttl:          s.options.PermitTTL,
+			acquiredAt:   time.Now(),
 			lost:         make(chan struct{}), done: make(chan struct{}),
 		}
-		permit.startSupervisor()
+		// 普通许可：supervisor 持续续租，持有者不释放就一直占着。
+		// 可过期许可（PermitTTL>0）：不续租，到期由 watcher 主动释放。
+		if permit.ttl <= 0 {
+			permit.startSupervisor()
+		} else {
+			permit.startExpiryWatcher(permit.ttl)
+		}
 		return permit, nil
 	}
 	return nil, ErrNoPermitAvailable
@@ -157,6 +170,8 @@ type Permit struct {
 	uncertain    bool
 	lostState    bool
 	refreshEvery time.Duration
+	ttl          time.Duration
+	acquiredAt   time.Time
 	lost         chan struct{}
 	done         chan struct{}
 	lostOnce     sync.Once
@@ -211,6 +226,32 @@ func (p *Permit) TTL(ctx context.Context) (time.Duration, error) {
 	return p.lock.TTL(ctx, p.ownerID)
 }
 
+// ExpiresIn 返回可过期许可的剩余有效期。
+// 可过期许可（PermitTTL > 0）到期由 watcher 主动释放，之后其他客户端可抢占该 slot；
+// 普通许可由 supervisor 持续续租，返回 0 表示"不会因时间到期而失效"。
+func (p *Permit) ExpiresIn(ctx context.Context) (time.Duration, error) {
+	p.mu.Lock()
+	ttl := p.ttl
+	acquiredAt := p.acquiredAt
+	released := p.released
+	uncertain := p.uncertain
+	p.mu.Unlock()
+	if released {
+		return 0, ErrPermitReleased
+	}
+	if uncertain {
+		return 0, ErrPermitUncertain
+	}
+	if ttl <= 0 {
+		return 0, nil
+	}
+	remaining := ttl - time.Since(acquiredAt)
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining, nil
+}
+
 // Release 释放当前 permit。重复调用返回 ErrPermitReleased。
 func (p *Permit) Release(ctx context.Context) error {
 	p.mu.Lock()
@@ -241,6 +282,30 @@ func (p *Permit) startSupervisor() {
 					return
 				}
 			}
+		}
+	}()
+}
+
+// startExpiryWatcher 在 ttl 到期后主动释放许可占用的 slot。
+// 只在可过期许可（PermitTTL > 0）上启动。
+func (p *Permit) startExpiryWatcher(ttl time.Duration) {
+	go func() {
+		timer := time.NewTimer(ttl)
+		defer timer.Stop()
+		select {
+		case <-p.done:
+			return
+		case <-timer.C:
+			p.mu.Lock()
+			if p.released {
+				p.mu.Unlock()
+				return
+			}
+			p.released = true
+			p.mu.Unlock()
+			p.doneOnce.Do(func() { close(p.done) })
+			// 主动释放，让出 slot；尽力而为，失败也无妨（锁租约兜底）。
+			_ = p.lock.UnLock(context.Background(), p.ownerID)
 		}
 	}()
 }
