@@ -110,8 +110,8 @@ func TestRateLimiterConcurrentAcquire(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			ok, err := rl.TryAcquire(ctx, 1)
-			// ErrLockBusy 是"令牌不足"的正常信号，不是错误。
-			if err != nil && !errors.Is(err, storage_lock.ErrLockBusy) {
+			// 令牌不足是正常信号，不是错误（ErrNoTokens 取代了原先复用的 ErrLockBusy）。
+			if err != nil && !IsNoTokens(err) {
 				t.Error(err)
 				return
 			}

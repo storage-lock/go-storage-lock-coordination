@@ -20,6 +20,21 @@ var (
 	ErrTokenBurstCapacity = errors.New("burst capacity must be >= tokens per second")
 )
 
+// ErrNoTokens 表示桶内令牌不足，本次请求未被放行。
+//
+// 早先这里复用 storage_lock.ErrLockBusy，导致调用方必须知道"限流内部是用锁记录实现"，
+// 而且日志里会显示成"锁被别人占着"——完全误导。限流不是互斥，
+// "现在额度不够"和"资源被占用"必须能区分。
+var ErrNoTokens = errors.New("not enough tokens in the bucket")
+
+// IsNoTokens 判断错误是否表示"令牌不足"。
+//
+// 同时识别旧的 ErrLockBusy：升级前调用方把"额度不够"当 ErrLockBusy 处理，
+// 只要还可能有旧版本客户端 / 旧错误路径，就不能让它们的判断突然失效。
+func IsNoTokens(err error) bool {
+	return errors.Is(err, ErrNoTokens) || errors.Is(err, storage_lock.ErrLockBusy)
+}
+
 // RateLimiterOptions 配置分布式令牌桶限流器。
 type RateLimiterOptions struct {
 	// TokensPerSecond 每秒补充的令牌数。必须为正整数。
@@ -92,7 +107,7 @@ func (r *RateLimiter) TryAcquire(ctx context.Context, n int64) (bool, error) {
 		if state.tokens < n {
 			// 顺带把补充后的状态写回去（尽力而为），避免长时间无人消费时积累满桶不生效。
 			_ = r.commit(ctx, state, state.tokens, now)
-			return false, storage_lock.ErrLockBusy
+			return false, ErrNoTokens
 		}
 		next := state.tokens - n
 		if err := r.commit(ctx, state, next, now); err != nil {

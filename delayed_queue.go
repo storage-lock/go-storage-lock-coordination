@@ -161,11 +161,12 @@ func (q *DelayedQueue) Claim(ctx context.Context, owner string) (*DelayedItem, e
 }
 
 // PendingItem 是 Peek 返回的队列观测条目。
+// Queue 与 DelayedQueue 共用这个类型：Queue 不使用 ReadyAt（其元素没有延迟概念）。
 type PendingItem struct {
-	ID      string
-	Payload string
-	ReadyAt time.Time
-	Held    bool
+	ID      string    `json:"id"`
+	Payload string    `json:"payload,omitempty"`
+	ReadyAt time.Time `json:"ready_at,omitzero"`
+	Held    bool      `json:"held"`
 }
 
 // Peek 列出当前可见（延迟已到且未被领走）的元素，只读不抢占。
@@ -193,6 +194,25 @@ func (q *DelayedQueue) Peek(ctx context.Context) ([]PendingItem, error) {
 		})
 	}
 	return result, nil
+}
+
+// AckByOwner 按 "元素 id + owner" 确认完成，等价于 DelayedItem.Ack。
+//
+// Claim 与 Ack 通常发生在不同进程里（Agent 每次调用都是新进程），
+// 只有 DelayedItem 的话调用方必须把对象留在内存里，跨进程做不到。
+// owner 对不上时底层 UnLock 会拒绝，不会误删别人的元素。
+func (q *DelayedQueue) AckByOwner(ctx context.Context, id, owner string) error {
+	if id == "" {
+		return storage_lock.ErrLockIdEmpty
+	}
+	if owner == "" {
+		return storage_lock.ErrOwnerIdEmpty
+	}
+	lock, err := q.itemLock(id, q.options.DisableWatchDog)
+	if err != nil {
+		return err
+	}
+	return lock.UnLock(ctx, owner)
 }
 
 func (q *DelayedQueue) prefix() string { return "dq-" + q.name + "-" }

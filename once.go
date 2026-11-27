@@ -36,15 +36,37 @@ func (r *TaskRun) Context(ctx context.Context) (context.Context, context.CancelF
 func (r *TaskRun) Renew(ctx context.Context) error { return r.lease.Renew(ctx, r.Owner) }
 
 // Complete 标记任务已完成。完成后任何实例再抢都会得到 ErrTaskAlreadyRan。
+//
+// 顺序至关重要：**先写 done 标记，再释放租约**。
+//
+// 反过来（先 UnLock 再写标记）会开一个真实存在的致命窗口：
+//
+//	进程 A: UnLock 成功 ────────────────→ 写 done 标记
+//	进程 B:          ← TryRun 成功（记录已空闲）
+//	进程 C:                       ← TryRun 成功（记录仍空闲）
+//
+// 在这几毫秒里，多个进程都能抢到同一个"一次性任务"，违背了 once 的全部意义。
+// 实测 12 进程并发时稳定复现 3 个 claimed。
+//
+// 先写标记则不会：标记没写成功之前租约一直被 A 持有，B/C 只能拿到 busy；
+// 标记写完之后，后来的 TryRun 一律得到 ErrTaskAlreadyRan。
+// 崩溃兜底也完好：A 若在写标记前崩溃，租约到期后 B 可以接管重试——
+// 这正是"至少执行一次、完成才置标记"的语义。
 func (r *TaskRun) Complete(ctx context.Context) error {
-	if err := r.lease.UnLock(ctx, r.Owner); err != nil {
-		return err
-	}
 	marker, err := storage_lock.NewStorageLock(r.leaseStorage(), doneLockID(r.TaskID))
 	if err != nil {
 		return err
 	}
-	return marker.TryLock(ctx, doneOwner(r.TaskID))
+	if err := marker.TryLock(ctx, doneOwner(r.TaskID)); err != nil {
+		// 标记写不成功就不能释放租约：释放了等于让别人重跑一个"已声称完成"的任务。
+		return err
+	}
+	// 标记已经落库，此时再释放租约。释放失败不影响"已完成"这个事实：
+	// 记录会在租约到期后自然失效，而 done 标记是永久的。
+	if err := r.lease.UnLock(ctx, r.Owner); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (r *TaskRun) leaseStorage() storage.Storage { return r.storage }

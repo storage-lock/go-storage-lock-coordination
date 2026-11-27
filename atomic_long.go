@@ -106,6 +106,26 @@ func (c *AtomicLong) GetAndAdd(ctx context.Context, delta int64) (int64, error) 
 	}
 }
 
+// Set 无条件把计数值设为 value。
+//
+// 与 CompareAndSet 的区别：Set 不检查当前值，适合"运维手动纠正"。
+// 业务代码里做状态机守卫请用 CompareAndSet——Set 会覆盖掉并发写入。
+func (c *AtomicLong) Set(ctx context.Context, value int64) error {
+	for {
+		_, version, since, err := c.readState(ctx)
+		if err != nil {
+			return err
+		}
+		if err := c.write(ctx, version, value, since); err != nil {
+			if isRetryableRateErr(err) {
+				continue
+			}
+			return err
+		}
+		return nil
+	}
+}
+
 // CompareAndSet 仅当当前值等于 expect 时更新为 update，返回是否成功。
 func (c *AtomicLong) CompareAndSet(ctx context.Context, expect, update int64) (bool, error) {
 	for {
